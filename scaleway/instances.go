@@ -19,6 +19,7 @@ package scaleway
 import (
 	"context"
 	"fmt"
+	"time"
 
 	scwinstance "github.com/scaleway/scaleway-sdk-go/api/instance/v1"
 	scwipam "github.com/scaleway/scaleway-sdk-go/api/ipam/v1"
@@ -245,16 +246,42 @@ func (i *instances) getPrivateNetworkAddresses(server *scwinstance.Server) ([]v1
 }
 
 // getIPsForPrivateNIC queries IPAM for IPs assigned to a specific private NIC
+// It retries on transient 5xx errors with exponential backoff.
 func (i *instances) getIPsForPrivateNIC(server *scwinstance.Server, pNIC *scwinstance.PrivateNIC, region scw.Region) ([]v1.NodeAddress, error) {
-	ips, err := i.ipam.ListIPs(&scwipam.ListIPsRequest{
-		ProjectID:    &server.Project,
-		ResourceType: scwipam.ResourceTypeInstancePrivateNic,
-		ResourceID:   &pNIC.ID,
-		IsIPv6:       scw.BoolPtr(false),
-		Region:       region,
-	})
+	var ips *scwipam.ListIPsResponse
+	var err error
+
+	maxRetries := 3
+	baseDelay := 1 * time.Second
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		ips, err = i.ipam.ListIPs(&scwipam.ListIPsRequest{
+			ProjectID:    &server.Project,
+			ResourceType: scwipam.ResourceTypeInstancePrivateNic,
+			ResourceID:   &pNIC.ID,
+			IsIPv6:       scw.BoolPtr(false),
+			Region:       region,
+		})
+
+		if err == nil {
+			break
+		}
+
+		if !isRetryableError(err) {
+			return nil, fmt.Errorf("unable to query ipam for node %s NIC %s: %v", server.Name, pNIC.ID, err)
+		}
+
+		if attempt < maxRetries {
+			delay := baseDelay * time.Duration(1<<attempt)
+			klog.Warningf("IPAM query failed for node %s NIC %s (attempt %d/%d), retrying in %v: %v",
+				server.Name, pNIC.ID, attempt+1, maxRetries, delay, err)
+			time.Sleep(delay)
+		}
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("unable to query ipam for node %s NIC %s: %v", server.Name, pNIC.ID, err)
+		return nil, fmt.Errorf("unable to query ipam for node %s NIC %s after %d attempts: %v",
+			server.Name, pNIC.ID, maxRetries, err)
 	}
 
 	var addresses []v1.NodeAddress

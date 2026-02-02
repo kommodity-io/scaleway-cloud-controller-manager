@@ -229,6 +229,12 @@ func (f *fakeInstanceAPI) GetServer(req *scwinstance.GetServerRequest, opts ...s
 type fakeIPAMAPI struct {
 	// IPs maps NIC ID to list of IPs
 	IPs map[string][]*scwipam.IP
+	// ErrorToReturn allows tests to inject errors
+	ErrorToReturn error
+	// CallCount tracks how many times ListIPs was called
+	CallCount int
+	// FailUntilAttempt causes errors until this attempt number (1-indexed)
+	FailUntilAttempt int
 }
 
 func newFakeIPAMAPI() *fakeIPAMAPI {
@@ -257,6 +263,13 @@ func newFakeIPAMAPI() *fakeIPAMAPI {
 }
 
 func (f *fakeIPAMAPI) ListIPs(req *scwipam.ListIPsRequest, opts ...scw.RequestOption) (*scwipam.ListIPsResponse, error) {
+	f.CallCount++
+
+	// Return error if configured and we haven't reached the success attempt yet
+	if f.ErrorToReturn != nil && (f.FailUntilAttempt == 0 || f.CallCount <= f.FailUntilAttempt) {
+		return nil, f.ErrorToReturn
+	}
+
 	if req.ResourceID == nil {
 		return &scwipam.ListIPsResponse{IPs: []*scwipam.IP{}}, nil
 	}
@@ -762,5 +775,118 @@ func TestInstances_PrivateNetworkAddresses(t *testing.T) {
 		returnedAddresses, err := instance.NodeAddressesByProviderID(context.TODO(), "scaleway://instance/fr-par-2/multi-pn-server-id")
 		AssertNoError(t, err)
 		Equals(t, expectedAddresses, returnedAddresses)
+	})
+}
+
+func TestGetIPsForPrivateNIC_RetryOnTransientError(t *testing.T) {
+	t.Run("RetryOn503Error", func(t *testing.T) {
+		// Setup fake IPAM that fails with 503 twice then succeeds
+		fakeIPAM := &fakeIPAMAPI{
+			IPs: map[string][]*scwipam.IP{
+				"nic-private-only": {
+					{
+						Address: scw.IPNet{IPNet: net.IPNet{IP: net.ParseIP("10.200.0.5"), Mask: net.CIDRMask(20, 32)}},
+					},
+				},
+			},
+			ErrorToReturn:    &scw.ResponseError{StatusCode: 503},
+			FailUntilAttempt: 2, // Fail on attempts 1 and 2, succeed on attempt 3
+		}
+
+		instance := &instances{
+			api:  newFakeInstanceAPI(),
+			ipam: fakeIPAM,
+			pnID: "pn-12345",
+		}
+
+		server := &scwinstance.Server{
+			Name:    "test-server",
+			Project: "test-project",
+			PrivateNics: []*scwinstance.PrivateNIC{
+				{
+					ID:               "nic-private-only",
+					PrivateNetworkID: "pn-12345",
+				},
+			},
+		}
+
+		addresses, err := instance.getIPsForPrivateNIC(server, server.PrivateNics[0], scw.RegionFrPar)
+
+		AssertNoError(t, err)
+		if fakeIPAM.CallCount != 3 {
+			t.Errorf("Expected 3 IPAM calls (2 failures + 1 success), got %d", fakeIPAM.CallCount)
+		}
+		if len(addresses) != 1 {
+			t.Errorf("Expected 1 address, got %d", len(addresses))
+		}
+	})
+
+	t.Run("NoRetryOn4xxError", func(t *testing.T) {
+		// Setup fake IPAM that fails with 404 - should not retry
+		fakeIPAM := &fakeIPAMAPI{
+			IPs:           map[string][]*scwipam.IP{},
+			ErrorToReturn: &scw.ResponseError{StatusCode: 404},
+		}
+
+		instance := &instances{
+			api:  newFakeInstanceAPI(),
+			ipam: fakeIPAM,
+			pnID: "pn-12345",
+		}
+
+		server := &scwinstance.Server{
+			Name:    "test-server",
+			Project: "test-project",
+			PrivateNics: []*scwinstance.PrivateNIC{
+				{
+					ID:               "nic-test",
+					PrivateNetworkID: "pn-12345",
+				},
+			},
+		}
+
+		_, err := instance.getIPsForPrivateNIC(server, server.PrivateNics[0], scw.RegionFrPar)
+
+		if err == nil {
+			t.Error("Expected error, got nil")
+		}
+		if fakeIPAM.CallCount != 1 {
+			t.Errorf("Expected 1 IPAM call (no retry for 4xx), got %d", fakeIPAM.CallCount)
+		}
+	})
+
+	t.Run("ExhaustedRetries", func(t *testing.T) {
+		// Setup fake IPAM that always fails with 503
+		fakeIPAM := &fakeIPAMAPI{
+			IPs:           map[string][]*scwipam.IP{},
+			ErrorToReturn: &scw.ResponseError{StatusCode: 503},
+		}
+
+		instance := &instances{
+			api:  newFakeInstanceAPI(),
+			ipam: fakeIPAM,
+			pnID: "pn-12345",
+		}
+
+		server := &scwinstance.Server{
+			Name:    "test-server",
+			Project: "test-project",
+			PrivateNics: []*scwinstance.PrivateNIC{
+				{
+					ID:               "nic-test",
+					PrivateNetworkID: "pn-12345",
+				},
+			},
+		}
+
+		_, err := instance.getIPsForPrivateNIC(server, server.PrivateNics[0], scw.RegionFrPar)
+
+		if err == nil {
+			t.Error("Expected error after exhausting retries, got nil")
+		}
+		// Should have tried 4 times (initial + 3 retries)
+		if fakeIPAM.CallCount != 4 {
+			t.Errorf("Expected 4 IPAM calls, got %d", fakeIPAM.CallCount)
+		}
 	})
 }
